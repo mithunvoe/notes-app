@@ -108,6 +108,29 @@ class ChromaService:
     def count(self) -> int:
         """Get total number of chunks in collection."""
         return self.collection.count()
+    
+    def count_by_file_id(self, file_id: str) -> int:
+        """
+        Count chunks for a specific file ID in ChromaDB.
+        
+        Args:
+            file_id: File ID to count chunks for
+        
+        Returns:
+            Number of chunks for this file_id
+        """
+        try:
+            # Get all chunks with this file_id
+            result = self.collection.get(
+                where={"file_id": file_id},
+                include=["documents"]
+            )
+            if result and 'ids' in result:
+                return len(result['ids'])
+            return 0
+        except Exception:
+            # If get fails, return 0
+            return 0
 
 
 # Global Chroma service instance

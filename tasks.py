@@ -213,44 +213,35 @@ def summarize_chunks_task(self, file_id: str, chunk_ids: List[str], note_style: 
                 error_msg = f"Error summarizing chunk {chunk['chunk_id']}: {str(e)}"
                 print(error_msg)
                 
-                # Fallback: extract key sentences from the chunk for ANY error
-                # This ensures we don't lose content even if LLM fails
-                try:
-                    # Simple extractive summary as fallback
-                    sentences = chunk['chunk_text'].split('.')
-                    # Get first few meaningful sentences (skip empty ones)
-                    key_sentences = [s.strip() for s in sentences if len(s.strip()) > 20][:5]  # Get more sentences for fallback
-                    if key_sentences:
-                        fallback_summary = ". ".join(key_sentences) + "."
-                        
-                        # Determine fallback reason
-                        if "SAFETY" in str(e) or "blocked" in str(e).lower():
-                            fallback_reason = "safety filter"
-                        elif "parts" in str(e).lower() or "api" in str(e).lower():
-                            fallback_reason = "API error"
-                        else:
-                            fallback_reason = "error"
-                        
-                        print(f"Using fallback extractive summary for chunk {chunk['chunk_id']} due to {fallback_reason}")
-                        
-                        # Store fallback summary
-                        summary_data = {
-                            'file_id': file_id,
-                            'chunk_id': chunk['chunk_id'],
-                            'chunk_index': chunk['chunk_index'],
-                            'summary_text': f"[Fallback due to {fallback_reason}] {fallback_summary}",
-                            'llm_provider': 'fallback',
-                            'llm_model': 'extractive',
-                            'tokens_used': 0
-                        }
-                        db.create_summary(summary_data)
-                        summaries.append(fallback_summary)
-                        successful_summaries += 1
-                        continue  # Successfully created fallback, skip error handling
-                except Exception as fallback_error:
-                    print(f"Fallback extraction also failed: {fallback_error}")
+                # Fallback for safety blocks: extract key sentences from the chunk
+                if "SAFETY" in str(e) or "blocked" in str(e).lower():
+                    try:
+                        # Simple extractive summary as fallback
+                        sentences = chunk['chunk_text'].split('.')
+                        # Get first few meaningful sentences (skip empty ones)
+                        key_sentences = [s.strip() for s in sentences if len(s.strip()) > 20][:3]
+                        if key_sentences:
+                            fallback_summary = ". ".join(key_sentences) + "."
+                            print(f"Using fallback summary for chunk {chunk['chunk_id']} due to safety block")
+                            
+                            # Store fallback summary
+                            summary_data = {
+                                'file_id': file_id,
+                                'chunk_id': chunk['chunk_id'],
+                                'chunk_index': chunk['chunk_index'],
+                                'summary_text': f"[Fallback due to safety filter] {fallback_summary}",
+                                'llm_provider': 'fallback',
+                                'llm_model': 'extractive',
+                                'tokens_used': 0
+                            }
+                            db.create_summary(summary_data)
+                            summaries.append(fallback_summary)
+                            successful_summaries += 1
+                            continue  # Successfully created fallback, skip error handling
+                    except Exception as fallback_error:
+                        print(f"Fallback extraction also failed: {fallback_error}")
                 
-                # Note: No fallback could be created, so this chunk will be missing from the final note
+                # Don't add placeholder to summaries list - we need actual DB entries
                 
                 # If it's a rate limit error, wait longer before processing next chunk
                 error_str = str(e).lower()
@@ -372,6 +363,9 @@ def synthesize_notes_task(self, file_id: str, note_style: str = "moderate", user
                 # Generate markdown filename
                 md_filename = get_note_filename(original_filename, file_id)
                 md_file_path = os.path.join(settings.notes_dir, md_filename)
+                
+                # Ensure notes directory exists
+                os.makedirs(settings.notes_dir, exist_ok=True)
                 
                 # Prepare metadata for frontmatter
                 frontmatter_metadata = {

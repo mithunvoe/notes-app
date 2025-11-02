@@ -13,7 +13,7 @@ supabase==2.23.0
 psycopg2-binary==2.9.9
 
 # PDF processing
-PyMuPDF==1.23.8
+PyMuPDF>=1.25.3
 pdfplumber==0.10.3
 ocrmypdf==16.0.3
 pytesseract==0.3.10
@@ -31,6 +31,9 @@ tiktoken==0.5.2
 # LLM integration
 google-generativeai==0.8.3
 openai==1.55.3
+
+# Markdown to PDF conversion
+markdown-pdf==1.10
 
 # Utilities
 python-dotenv==1.0.0

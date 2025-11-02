@@ -504,7 +504,7 @@ Sources:
         effective_max_tokens = min(
             max_tokens,
             max(MIN_OUTPUT_TOKENS, available_for_output),  # At least MIN_OUTPUT_TOKENS, but respect available space
-            32768  # Hard cap for most Gemini models
+            55000  # Hard cap for most Gemini models
         )
         
         # If prompt is extremely long and we can't generate even minimum output, warn and reduce more
@@ -524,7 +524,7 @@ Sources:
             }],
             "generationConfig": {
                 "maxOutputTokens": effective_max_tokens,
-                "temperature": 0.3
+                "temperature": 1.0
             },
             "safetySettings": safety_settings_rest
         }

@@ -1,10 +1,13 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Query, Form
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
+from markdown_pdf import MarkdownPdf, Section
+import io
 from pydantic import BaseModel
 from typing import Optional, List
 from enum import Enum
 import os
+import json
 from uuid import uuid4
 from datetime import datetime
 
@@ -14,6 +17,7 @@ from tasks import process_file_task
 from chroma_client import chroma_service
 from llm_service import llm_service
 from utils import compute_bytes_hash, ensure_directory, embedding_service
+from utils.file_utils import get_note_filename
 
 
 # Create FastAPI app
@@ -102,6 +106,8 @@ async def root():
             "upload": "/upload",
             "status": "/status/{file_id}",
             "note": "/notes/{file_id}",
+            "download_note_md": "/notes/{file_id}/download",
+            "download_note_pdf": "/notes/{file_id}/download-pdf",
             "qa": "/qa/{file_id}",
             "files": "/files",
             "retry": "/files/{file_id}/retry"
@@ -327,16 +333,19 @@ async def list_files(
         )
 
 
-@app.get("/notes/{file_id}", response_model=NoteResponse)
-async def get_note(file_id: str):
+@app.get("/notes/{file_id}")
+async def get_note(file_id: str, format: Optional[str] = Query(None, description="Response format: 'html' for HTML page with download button, or 'json' for JSON (default)")):
     """
     Get the generated note for a file.
     
     Args:
         file_id: File ID
+        format: Optional format parameter ('html' or 'json'). Defaults to 'json'.
+                If 'html' is specified, returns an HTML page with download button.
+                If accessed via browser without format parameter, defaults to JSON for API compatibility.
     
     Returns:
-        Generated note
+        Generated note (JSON or HTML depending on format parameter)
     """
     # Check if file exists
     file_info = db.get_file(file_id)
@@ -355,12 +364,414 @@ async def get_note(file_id: str):
     if not note:
         raise HTTPException(status_code=404, detail="Note not found")
     
+    # If HTML format is requested, return HTML page with download button
+    if format == 'html':
+        # Import html escaping module
+        import html as html_module
+        # Escape HTML special characters in note text
+        note_text_html = html_module.escape(note['note_text'])
+        # Convert markdown-style formatting (basic conversions)
+        note_text_html = note_text_html.replace('\n', '<br>')
+        
+        # Escape values for HTML template
+        escaped_filename = html_module.escape(file_info.get('original_filename', file_id))
+        escaped_file_id = html_module.escape(file_id)
+        escaped_created_at = html_module.escape(str(note.get('created_at', 'N/A')))
+        
+        html_content = f"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Note - {escaped_filename}</title>
+    <style>
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            max-width: 900px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }}
+        .container {{
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            padding: 30px;
+        }}
+        .header {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+            padding-bottom: 20px;
+            border-bottom: 2px solid #e0e0e0;
+        }}
+        h1 {{
+            margin: 0;
+            color: #333;
+            font-size: 24px;
+        }}
+        .download-btn {{
+            background-color: #007bff;
+            color: white;
+            padding: 10px 20px;
+            text-decoration: none;
+            border-radius: 5px;
+            font-weight: 500;
+            display: inline-block;
+            transition: background-color 0.2s;
+        }}
+        .download-btn:hover {{
+            background-color: #0056b3;
+        }}
+        .metadata {{
+            color: #666;
+            font-size: 14px;
+            margin-bottom: 20px;
+        }}
+        .note-content {{
+            line-height: 1.6;
+            color: #333;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>Note: {escaped_filename}</h1>
+            <div style="display: flex; gap: 10px;">
+                <a href="/notes/{escaped_file_id}/download" class="download-btn" download>📥 Download as Markdown</a>
+                <a href="/notes/{escaped_file_id}/download-pdf" class="download-btn" style="background-color: #dc3545;" download>📄 Download as PDF</a>
+            </div>
+        </div>
+        <div class="metadata">
+            <strong>File ID:</strong> {escaped_file_id}<br>
+            <strong>Created:</strong> {escaped_created_at}
+        </div>
+        <div class="note-content">
+{note_text_html}
+        </div>
+    </div>
+</body>
+</html>
+        """
+        return HTMLResponse(content=html_content)
+    
+    # Default: return JSON response
     return NoteResponse(
         file_id=file_id,
         note_text=note['note_text'],
         metadata=note.get('metadata'),
         created_at=note['created_at']
     )
+
+
+@app.get("/notes/{file_id}/download")
+async def download_note(file_id: str):
+    """
+    Download the generated note for a file as a markdown (.md) file.
+    
+    Args:
+        file_id: File ID
+    
+    Returns:
+        Markdown file for download
+    """
+    # Check if file exists
+    file_info = db.get_file(file_id)
+    if not file_info:
+        raise HTTPException(status_code=404, detail="File not found")
+    
+    # Check status
+    if file_info['status'] != 'completed':
+        raise HTTPException(
+            status_code=400,
+            detail=f"Note not ready. Current status: {file_info['status']}"
+        )
+    
+    # Get note
+    note = db.get_note_by_file(file_id)
+    if not note:
+        raise HTTPException(status_code=404, detail="Note not found")
+    
+    # Prepare markdown content with frontmatter
+    markdown_content = ""
+    
+    # Add YAML frontmatter with metadata
+    metadata = note.get('metadata', {})
+    frontmatter_metadata = {
+        'file_id': file_id,
+        'original_filename': file_info.get('original_filename', ''),
+        'created_at': note.get('created_at', ''),
+    }
+    
+    # Add note metadata if available
+    if metadata:
+        frontmatter_metadata.update(metadata)
+    
+    # Add LLM info if available
+    if note.get('llm_provider'):
+        frontmatter_metadata['llm_provider'] = note['llm_provider']
+    if note.get('llm_model'):
+        frontmatter_metadata['llm_model'] = note['llm_model']
+    if note.get('tokens_used'):
+        frontmatter_metadata['tokens_used'] = note['tokens_used']
+    
+    if frontmatter_metadata:
+        markdown_content += "---\n"
+        for key, value in frontmatter_metadata.items():
+            if value is not None:
+                # Handle different value types for YAML
+                if isinstance(value, (dict, list)):
+                    markdown_content += f"{key}: {json.dumps(value)}\n"
+                elif isinstance(value, bool):
+                    markdown_content += f"{key}: {str(value).lower()}\n"
+                elif isinstance(value, (int, float)):
+                    markdown_content += f"{key}: {value}\n"
+                else:
+                    value_str = str(value)
+                    if ':' in value_str or '\n' in value_str:
+                        markdown_content += f"{key}: {json.dumps(value_str)}\n"
+                    else:
+                        markdown_content += f"{key}: {value_str}\n"
+        markdown_content += "---\n\n"
+    
+    # Add the note content
+    markdown_content += note['note_text']
+    
+    # Generate filename for download
+    original_filename = file_info.get('original_filename', '')
+    download_filename = get_note_filename(original_filename, file_id)
+    
+    # Return markdown file as download
+    return Response(
+        content=markdown_content,
+        media_type="text/markdown",
+        headers={
+            "Content-Disposition": f'attachment; filename="{download_filename}"'
+        }
+    )
+
+
+@app.get("/notes/{file_id}/download-pdf")
+async def download_note_pdf(file_id: str):
+    """
+    Download the generated note for a file as a PDF (.pdf) file.
+    
+    Args:
+        file_id: File ID
+    
+    Returns:
+        PDF file for download
+    """
+    # Check if file exists
+    file_info = db.get_file(file_id)
+    if not file_info:
+        raise HTTPException(status_code=404, detail="File not found")
+    
+    # Check status
+    if file_info['status'] != 'completed':
+        raise HTTPException(
+            status_code=400,
+            detail=f"Note not ready. Current status: {file_info['status']}"
+        )
+    
+    # Get note
+    note = db.get_note_by_file(file_id)
+    if not note:
+        raise HTTPException(status_code=404, detail="Note not found")
+    
+    # Get original filename for use in PDF metadata
+    original_filename = file_info.get('original_filename', '')
+    
+    # For PDF, we'll use the note content without frontmatter
+    # Frontmatter is not needed in PDF and can cause TOC issues
+    note_text = note['note_text']
+    
+    # Ensure the document starts with an h1 heading for proper TOC generation
+    note_text_stripped = note_text.strip()
+    
+    # Check if note starts with any heading
+    if not note_text_stripped.startswith('#'):
+        # No heading - add h1 title at the beginning
+        title = original_filename.replace('.pdf', '') if original_filename else f"Note"
+        markdown_content = f"# {title}\n\n{note_text}"
+    else:
+        # Check if it starts with h1 (# heading)
+        lines = note_text_stripped.split('\n')
+        first_line = lines[0].strip()
+        
+        if first_line.startswith('# ') or first_line == '#':
+            # Already starts with h1, use as-is
+            markdown_content = note_text
+        elif first_line.startswith('##'):
+            # Starts with h2 or lower - need to add h1 or convert first heading
+            title = original_filename.replace('.pdf', '') if original_filename else f"Note"
+            markdown_content = f"# {title}\n\n{note_text}"
+        else:
+            # Already has heading, use as-is
+            markdown_content = note_text
+    
+    try:
+        # CSS styling for better PDF appearance
+        user_css = """
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            font-size: 11pt;
+            line-height: 1.6;
+            color: #333;
+        }
+        h1 {
+            font-size: 24pt;
+            color: #1a1a1a;
+            border-bottom: 2px solid #e0e0e0;
+            padding-bottom: 10px;
+            margin-top: 30px;
+            margin-bottom: 20px;
+        }
+        h2 {
+            font-size: 20pt;
+            color: #2a2a2a;
+            margin-top: 25px;
+            margin-bottom: 15px;
+            border-bottom: 1px solid #e0e0e0;
+            padding-bottom: 5px;
+        }
+        h3 {
+            font-size: 16pt;
+            color: #3a3a3a;
+            margin-top: 20px;
+            margin-bottom: 10px;
+        }
+        h4 {
+            font-size: 14pt;
+            color: #4a4a4a;
+            margin-top: 15px;
+            margin-bottom: 8px;
+        }
+        p {
+            margin: 10px 0;
+            text-align: justify;
+        }
+        ul, ol {
+            margin: 10px 0;
+            padding-left: 30px;
+        }
+        li {
+            margin: 5px 0;
+        }
+        code {
+            background-color: #f4f4f4;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-family: 'Courier New', monospace;
+            font-size: 10pt;
+        }
+        pre {
+            background-color: #f4f4f4;
+            padding: 15px;
+            border-radius: 5px;
+            overflow-x: auto;
+            border-left: 4px solid #007bff;
+            margin: 15px 0;
+        }
+        pre code {
+            background-color: transparent;
+            padding: 0;
+        }
+        blockquote {
+            border-left: 4px solid #ccc;
+            margin: 15px 0;
+            padding-left: 20px;
+            color: #666;
+            font-style: italic;
+        }
+        table {
+            border-collapse: collapse;
+            width: 100%;
+            margin: 15px 0;
+        }
+        th, td {
+            border: 1px solid #ddd;
+            padding: 8px;
+            text-align: left;
+        }
+        th {
+            background-color: #f2f2f2;
+            font-weight: bold;
+        }
+        hr {
+            border: none;
+            border-top: 1px solid #e0e0e0;
+            margin: 20px 0;
+        }
+        """
+        
+        # Create PDF from markdown using markdown-pdf library
+        # Try with TOC first, fallback to no TOC if hierarchy issues occur
+        try:
+            # Try with TOC enabled - use toc_level=1 to only include h1 headings
+            pdf = MarkdownPdf(toc_level=1, optimize=True)
+            
+            # Set PDF metadata
+            pdf.meta["title"] = original_filename.replace('.pdf', '') if original_filename else f"Note {file_id}"
+            pdf.meta["author"] = "PDF Notes API"
+            if note.get('llm_provider'):
+                pdf.meta["subject"] = f"Generated using {note.get('llm_provider')}"
+            
+            # Add markdown content as a section with custom CSS
+            # toc=True includes headings in table of contents
+            pdf.add_section(Section(markdown_content, toc=True), user_css=user_css)
+            
+            # Convert to PDF bytes
+            pdf_bytes = io.BytesIO()
+            pdf.save_bytes(pdf_bytes)
+            pdf_bytes.seek(0)
+            
+        except Exception as toc_error:
+            # If TOC fails due to hierarchy issues, retry without TOC
+            if "hierarchy" in str(toc_error).lower() or "level" in str(toc_error).lower():
+                # Disable TOC and try again
+                pdf = MarkdownPdf(toc_level=0, optimize=True)
+                
+                # Set PDF metadata
+                pdf.meta["title"] = original_filename.replace('.pdf', '') if original_filename else f"Note {file_id}"
+                pdf.meta["author"] = "PDF Notes API"
+                if note.get('llm_provider'):
+                    pdf.meta["subject"] = f"Generated using {note.get('llm_provider')}"
+                
+                # Add markdown content without TOC
+                pdf.add_section(Section(markdown_content, toc=False), user_css=user_css)
+                
+                # Convert to PDF bytes
+                pdf_bytes = io.BytesIO()
+                pdf.save_bytes(pdf_bytes)
+                pdf_bytes.seek(0)
+            else:
+                # Re-raise if it's a different error
+                raise
+        
+        # Generate filename for download (replace .md with .pdf)
+        md_filename = get_note_filename(original_filename, file_id)
+        pdf_filename = md_filename.replace('.md', '.pdf') if md_filename.endswith('.md') else f"{md_filename}.pdf"
+        
+        # Return PDF file as download
+        return Response(
+            content=pdf_bytes.getvalue(),
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": f'attachment; filename="{pdf_filename}"'
+            }
+        )
+    
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to generate PDF: {str(e)}"
+        )
 
 
 @app.post("/qa/{file_id}", response_model=AnswerResponse)
@@ -387,35 +798,80 @@ async def ask_question(file_id: str, request: QuestionRequest):
         )
     
     try:
-        # Embed the question
-        question_embedding = embedding_service.embed_text(request.question)
-        
-        # Query Chroma for relevant chunks
-        results = chroma_service.query(
-            query_embeddings=[question_embedding],
-            n_results=request.n_results,
-            where={"file_id": file_id},
-            include=["documents", "metadatas", "distances"]
-        )
-        
-        if not results['documents'][0]:
+        # First, check if chunks exist in database for this file
+        db_chunks = db.get_chunks_by_file(file_id)
+        if not db_chunks:
             raise HTTPException(
                 status_code=404,
-                detail="No relevant content found"
+                detail=f"No chunks found for this file. The file may not have been processed yet or chunks were not created."
             )
         
-        # Get retrieved documents and metadata
-        retrieved_docs = results['documents'][0]
-        retrieved_meta = results['metadatas'][0]
-        distances = results['distances'][0]
+        # Check if chunks exist in ChromaDB for this file
+        chroma_chunk_count = chroma_service.count_by_file_id(file_id)
+        if chroma_chunk_count == 0:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No chunks found in ChromaDB for this file. Database has {len(db_chunks)} chunks, but ChromaDB has 0. The embeddings may not have been stored. Try reprocessing the file using the /files/{file_id}/retry endpoint."
+            )
+        
+        # Embed the question
+        # embed_text returns List[float], but ChromaDB query needs List[List[float]]
+        question_embedding = embedding_service.embed_text(request.question)
+        question_embeddings = [question_embedding]  # Wrap in list for ChromaDB
+        
+        # Query Chroma for relevant chunks
+        try:
+            results = chroma_service.query(
+                query_embeddings=question_embeddings,
+                n_results=request.n_results,
+                where={"file_id": file_id},
+                include=["documents", "metadatas", "distances"]
+            )
+        except Exception as chroma_error:
+            raise HTTPException(
+                status_code=500,
+                detail=f"ChromaDB query failed: {str(chroma_error)}. Database has {len(db_chunks)} chunks, ChromaDB has {chroma_chunk_count} chunks for this file."
+            )
+        
+        # Check if results are valid
+        if not results or 'documents' not in results:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No relevant content found in ChromaDB. Database has {len(db_chunks)} chunks, ChromaDB has {chroma_chunk_count} chunks, but query returned no results."
+            )
+        
+        # Handle ChromaDB result structure (documents is a list of lists)
+        documents_list = results.get('documents', [])
+        metadatas_list = results.get('metadatas', [])
+        distances_list = results.get('distances', [])
+        
+        # Get first query result (since we only pass one query embedding)
+        if not documents_list or len(documents_list) == 0 or not documents_list[0] or len(documents_list[0]) == 0:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No relevant content found for this question. Database has {len(db_chunks)} chunks for this file, but ChromaDB returned empty results. Try a different question or verify the chunks were properly indexed."
+            )
+        
+        retrieved_docs = documents_list[0]
+        retrieved_meta = metadatas_list[0] if metadatas_list else []
+        distances = distances_list[0] if distances_list else []
+        
+        # Ensure all lists have the same length
+        min_length = min(len(retrieved_docs), len(retrieved_meta) if retrieved_meta else len(retrieved_docs), len(distances) if distances else len(retrieved_docs))
+        retrieved_docs = retrieved_docs[:min_length]
+        retrieved_meta = retrieved_meta[:min_length] if retrieved_meta else []
+        distances = distances[:min_length] if distances else [0.0] * min_length
         
         # Prepare sources with relevance scores
         sources = []
-        for i, (meta, distance) in enumerate(zip(retrieved_meta, distances)):
+        for i, doc in enumerate(retrieved_docs):
+            meta = retrieved_meta[i] if i < len(retrieved_meta) else {}
+            distance = distances[i] if i < len(distances) else 1.0
+            
             sources.append({
-                'chunk_index': meta['chunk_index'],
-                'relevance_score': float(1 - distance),  # Convert distance to similarity
-                'preview': retrieved_docs[i][:200] + "..." if len(retrieved_docs[i]) > 200 else retrieved_docs[i]
+                'chunk_index': meta.get('chunk_index', i),
+                'relevance_score': float(1 - distance) if distance <= 1.0 else 0.0,  # Convert distance to similarity
+                'preview': doc[:200] + "..." if len(doc) > 200 else doc
             })
         
         # Generate answer using LLM
@@ -424,12 +880,19 @@ async def ask_question(file_id: str, request: QuestionRequest):
             retrieved_docs
         )
         
+        # Validate answer result
+        if not answer_result or 'text' not in answer_result:
+            raise HTTPException(
+                status_code=500,
+                detail="LLM service did not return a valid answer"
+            )
+        
         return AnswerResponse(
             answer=answer_result['text'],
             sources=sources,
             model_info={
-                'provider': answer_result['provider'],
-                'model': answer_result['model'],
+                'provider': answer_result.get('provider', 'unknown'),
+                'model': answer_result.get('model', 'unknown'),
                 'tokens_used': answer_result.get('tokens_used', 0)
             }
         )
