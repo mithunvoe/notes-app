@@ -1,0 +1,39 @@
+# FastAPI and server
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+python-multipart==0.0.18
+
+# Celery and task queue
+celery==5.3.4
+redis==5.0.1
+flower==2.0.1
+
+# Database
+supabase==2.23.0
+psycopg2-binary==2.9.9
+
+# PDF processing
+PyMuPDF==1.23.8
+pdfplumber==0.10.3
+ocrmypdf==16.0.3
+pytesseract==0.3.10
+
+# Embeddings and vector DB
+numpy<2.0.0  # ensure numpy stays <2.0 as some libs haven’t caught up
+torch>=2.1.1,!=2.2.0  # use 2.1.1, avoid a hypothetical problematic 2.2.0 (adjust if needed)
+sentence-transformers==3.3.1  # requires torch>=1.11.0 :contentReference[oaicite:1]{index=1}
+chromadb==0.5.23  # note: possible tokenizers conflict with transformers :contentReference[oaicite:2]{index=2}
+
+# NLP utilities
+nltk==3.8.1
+tiktoken==0.5.2
+
+# LLM integration
+google-generativeai==0.8.3
+openai==1.55.3
+
+# Utilities
+python-dotenv==1.0.0
+pydantic==2.11.7
+pydantic-settings==2.8.0
+httpx==0.27.2
