@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     openai_api_key: Optional[str] = None
     llm_provider: str = "gemini"  # gemini, openai, or local
     gemini_model: str = "gemini-2.5-flash"  # Flash model: faster, cheaper, better rate limits
-    gemini_max_output_tokens: int = 32768  # Maximum output tokens for Gemini (Gemini 2.0+ supports up to 32,768)
+    gemini_max_output_tokens: int = 60000  # Maximum output tokens for Gemini (Gemini 2.0+ supports up to 32,768)
     openai_model: str = "gpt-3.5-turbo"
     
     # Application

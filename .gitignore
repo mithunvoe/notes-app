@@ -11,6 +11,7 @@ dist/
 build/
 uploads/
 data/
+notes/
 
 # IDEs
 .vscode/
