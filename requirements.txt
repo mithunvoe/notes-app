@@ -19,10 +19,11 @@ ocrmypdf==16.0.3
 pytesseract==0.3.10
 
 # Embeddings and vector DB
-numpy<2.0.0  # ensure numpy stays <2.0 as some libs haven’t caught up
-torch>=2.1.1,!=2.2.0  # use 2.1.1, avoid a hypothetical problematic 2.2.0 (adjust if needed)
-sentence-transformers==3.3.1  # requires torch>=1.11.0 :contentReference[oaicite:1]{index=1}
-chromadb==0.5.23  # note: possible tokenizers conflict with transformers :contentReference[oaicite:2]{index=2}
+numpy<2.0.0
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.5.1+cpu
+sentence-transformers==3.3.1
+chromadb==0.5.23
 
 # NLP utilities
 nltk==3.8.1
@@ -40,3 +41,6 @@ python-dotenv==1.0.0
 pydantic==2.11.7
 pydantic-settings==2.8.0
 httpx==0.27.2
+
+# Design Patterns
+transitions==0.9.0

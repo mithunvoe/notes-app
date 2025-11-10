@@ -17,10 +17,15 @@ WORKDIR /app
 
 # Copy requirements and install Python dependencies
 # Use BuildKit cache mount to cache pip packages between builds
-# Syntax: # syntax=docker/dockerfile:1.4
 COPY requirements.txt .
+
+# Configure pip for better reliability with large packages
+RUN pip install --upgrade pip setuptools wheel
+
+# Install dependencies with increased timeout for large packages like PyTorch
+# Remove --no-cache-dir to use BuildKit cache mount effectively
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install -r requirements.txt
+    pip install --default-timeout=1000 --retries 10 -r requirements.txt
 
 # Download NLTK data
 RUN python -c "import nltk; nltk.download('punkt'); nltk.download('punkt_tab')"

@@ -37,10 +37,6 @@ class SupabaseClient:
         response = self.client.table('files').select('*').eq('sha256', sha256).execute()
         return response.data[0] if response.data else None
     
-    def delete_file(self, file_id: str) -> None:
-        """Delete file record from database"""
-        self.client.table('files').delete().eq('id', file_id).execute()
-    
     def list_files(self, limit: int = 10, offset: int = 0) -> Dict[str, Any]:
         """
         List all files with pagination.
@@ -115,25 +111,6 @@ class SupabaseClient:
         if metadata:
             update_data['metadata'] = metadata
         self.client.table('notes').update(update_data).eq('file_id', file_id).execute()
-    
-    def delete_note(self, file_id: str) -> None:
-        """Delete note for a file"""
-        self.client.table('notes').delete().eq('file_id', file_id).execute()
-    
-    def delete_chunks(self, file_id: str) -> None:
-        """Delete all chunks for a file (will cascade delete summaries)"""
-        self.client.table('chunks').delete().eq('file_id', file_id).execute()
-    
-    def delete_summaries(self, file_id: str) -> None:
-        """Delete all summaries for a file"""
-        self.client.table('summaries').delete().eq('file_id', file_id).execute()
-    
-    def cleanup_file_data(self, file_id: str) -> None:
-        """Clean up all processing data for a file (chunks, summaries, notes)"""
-        # Delete notes first (since it has UNIQUE constraint)
-        self.delete_note(file_id)
-        # Delete chunks (will cascade delete summaries)
-        self.delete_chunks(file_id)
 
 
 # Global instance

@@ -3,11 +3,15 @@ from celery_app import celery
 from typing import List, Dict, Any
 import os
 import time
+import re
 from datetime import datetime
 
 from database import db
 from chroma_client import chroma_service
-from llm_service import llm_service
+# Use new Strategy Pattern for LLM
+from patterns.strategy import LLMContext
+# Use new State Machine Pattern for file processing
+from patterns.state_machine import FileStateMachine, create_state_machine_from_db
 from config import settings
 from utils import (
     extract_text_from_pdf,
@@ -18,18 +22,128 @@ from utils import (
     get_note_filename
 )
 
+# Initialize LLM context with strategy pattern
+llm_context = LLMContext()  # Auto-selects strategy based on config
+
+
+def db_update_callback(file_id: str, new_state: str, error_message: str = None):
+    """
+    Callback function for state machine to update database.
+    This decouples the state machine from database implementation.
+    """
+    db.update_file_status(file_id, new_state, error=error_message)
+
+
+def convert_pseudo_code_to_math(note_text: str) -> str:
+    """
+    Convert pseudo-code blocks containing mathematical notation to LaTeX equations.
+    
+    Detects code blocks that contain mathematical notation (subscripts, fractions, etc.)
+    and converts them to proper LaTeX display math blocks.
+    
+    Args:
+        note_text: The markdown note text
+        
+    Returns:
+        Processed markdown text with pseudo-code converted to math equations
+    """
+    # Pattern to match code blocks (```...``` or with language identifier)
+    code_block_pattern = r'```(?:[a-zA-Z]*)?\n?(.*?)```'
+    
+    def process_code_block(match):
+        code_content = match.group(1).strip()
+        
+        # Check if the code block contains mathematical notation
+        # Look for patterns like: _{}, fractions (/), subscripts, etc.
+        has_math_notation = (
+            re.search(r'_\s*\{[^}]+\}', code_content) or  # Subscripts like b_{L[n]}
+            re.search(r'[a-zA-Z]+\s*/\s*[a-zA-Z]+', code_content) or  # Fractions like b/a
+            re.search(r'=\s*[a-zA-Z]+\s*/\s*[a-zA-Z]+', code_content)  # Assignments with fractions
+        )
+        
+        # Check if it looks like pseudo-code with math (has comments and math notation)
+        has_comments = '//' in code_content or ('#' in code_content and not code_content.strip().startswith('#'))
+        has_loops = bool(re.search(r'\b(Do|For|While|End|downto|to)\b', code_content, re.IGNORECASE))
+        
+        # If it contains math notation and looks like pseudo-code, convert to math equations
+        if has_math_notation and (has_comments or has_loops):
+            # Extract mathematical expressions and convert them
+            lines = code_content.split('\n')
+            math_lines = []
+            
+            for line in lines:
+                original_line = line
+                # Remove comments
+                if '//' in line:
+                    line = line[:line.index('//')].strip()
+                elif '#' in line and not line.strip().startswith('#'):
+                    # Check if # is part of a heading (not a comment)
+                    if not re.match(r'^\s*#+\s+', line):
+                        line = line[:line.index('#')].strip()
+                
+                # Skip loop control structures (they're not math equations)
+                if re.search(r'\b(Do|For|While|End|downto|to)\b', line, re.IGNORECASE):
+                    # Try to extract any math from these lines
+                    # For example, "Do i = n-1 downto 1" could become "i = n-1, \ldots, 1"
+                    if '=' in line:
+                        parts = line.split('=')
+                        if len(parts) == 2:
+                            var_part = parts[0].strip()
+                            expr_part = parts[1].strip()
+                            # Extract math expressions
+                            if has_math_notation or re.search(r'[0-9]', expr_part):
+                                # Convert to math notation
+                                math_lines.append(f"{var_part} = {expr_part}")
+                    continue
+                
+                line = line.strip()
+                if line and not line.startswith('//') and not line.startswith('#'):
+                    # Convert mathematical expressions to proper LaTeX
+                    # First, fix patterns like b_{L[n]} to ensure proper LaTeX formatting
+                    # Replace patterns like xn (where n is a number) with x_n
+                    line = re.sub(r'\b([a-zA-Z]+)([0-9]+)\b', r'\1_{\2}', line)
+                    # Replace patterns like xj, xi (where j/i are letters) with x_j, x_i  
+                    line = re.sub(r'\b([a-zA-Z]+)([ij])\b(?![\w])', r'\1_{\2}', line)
+                    # Ensure subscripts are properly formatted
+                    # Patterns like a_{L[i],j} are already correct, but ensure spacing
+                    line = re.sub(r'_\s*\{', r'_{', line)
+                    
+                    # Convert division operations to fractions where appropriate
+                    # But be careful not to break variable names
+                    line = re.sub(r'([a-zA-Z0-9_]+)\s*/\s*([a-zA-Z0-9_]+)', r'\\frac{\1}{\2}', line)
+                    
+                    math_lines.append(line)
+            
+            if math_lines:
+                # Combine into a math display block with proper LaTeX formatting
+                math_content = ' \\\\\n'.join(math_lines)  # Use \\ for line breaks in LaTeX
+                # Wrap in LaTeX display math block
+                return f'\n$$\n\\begin{{aligned}}\n{math_content}\n\\end{{aligned}}\n$$\n'
+        
+        # Otherwise, keep as code block
+        return match.group(0)
+    
+    # Process all code blocks
+    processed_text = re.sub(code_block_pattern, process_code_block, note_text, flags=re.DOTALL | re.MULTILINE)
+    
+    return processed_text
+
 
 class CallbackTask(Task):
     """Base task with error handling"""
     def on_failure(self, exc, task_id, args, kwargs, einfo):
-        """Handle task failure"""
+        """Handle task failure - using State Machine pattern"""
         file_id = args[0] if args else None
         if file_id:
-            db.update_file_status(
-                file_id,
-                status='failed',
-                error=str(exc)
-            )
+            try:
+                # Create state machine with current state from DB
+                file_info = db.get_file(file_id)
+                current_status = file_info['status'] if file_info else 'uploaded'
+                fsm = create_state_machine_from_db(file_id, current_status, db_update_callback)
+                fsm.fail(str(exc))
+            except Exception:
+                # Fallback to direct update if state machine has issues
+                db.update_file_status(file_id, 'failed', error=str(exc))
 
 
 @celery.task(bind=True, base=CallbackTask, acks_late=True, max_retries=3)
@@ -51,8 +165,9 @@ def process_file_task(self, file_id: str, file_path: str, note_style: str = "mod
         user_prompt: Optional custom instructions
     """
     try:
-        # Update status to processing
-        db.update_file_status(file_id, 'processing')
+        # Use State Machine pattern for file processing states
+        fsm = FileStateMachine(file_id, db_update_callback)
+        fsm.start_processing()
         
         # Step 1: Extract text
         self.update_state(state='PROGRESS', meta={'step': 'extracting_text'})
@@ -110,8 +225,8 @@ def process_file_task(self, file_id: str, file_path: str, note_style: str = "mod
             embeddings=embeddings
         )
         
-        # Update file status
-        db.update_file_status(file_id, 'indexed')
+        # Use State Machine: transition to indexed
+        fsm.finish_indexing()
         
         # Step 6: Enqueue summarization task with note style
         self.update_state(state='PROGRESS', meta={'step': 'enqueuing_summarization'})
@@ -123,9 +238,14 @@ def process_file_task(self, file_id: str, file_path: str, note_style: str = "mod
             'total_tokens': sum(c['token_count'] for c in chunks),
             'pdf_metadata': pdf_metadata
         }
-        
+
     except Exception as e:
-        db.update_file_status(file_id, 'failed', error=str(e))
+        # Use State Machine: transition to failed
+        try:
+            fsm.fail(str(e))
+        except Exception:
+            # Fallback to direct update if state machine fails
+            db.update_file_status(file_id, 'failed', error=str(e))
         raise
 
 
@@ -141,7 +261,11 @@ def summarize_chunks_task(self, file_id: str, chunk_ids: List[str], note_style: 
         user_prompt: Optional custom instructions
     """
     try:
-        db.update_file_status(file_id, 'summarizing')
+        # Use State Machine: transition to summarizing
+        file_info = db.get_file(file_id)
+        current_status = file_info['status'] if file_info else 'indexed'
+        fsm = create_state_machine_from_db(file_id, current_status, db_update_callback)
+        fsm.start_summarizing()
         
         # Get chunks from database
         chunks = db.get_chunks_by_file(file_id)
@@ -164,9 +288,9 @@ def summarize_chunks_task(self, file_id: str, chunk_ids: List[str], note_style: 
                 }
             )
             
-            # Generate summary for chunk with specified style
+            # Generate summary for chunk with specified style using Strategy Pattern
             try:
-                result = llm_service.generate_summary(
+                result = llm_context.generate_summary(
                     chunk['chunk_text'],
                     note_style=note_style,
                     user_prompt=user_prompt
@@ -194,7 +318,8 @@ def summarize_chunks_task(self, file_id: str, chunk_ids: List[str], note_style: 
                 
                 # Rate limiting: Gemini free tier allows 10 requests/minute for Flash, 2 for Pro
                 # Add delay between chunk summaries to respect rate limits
-                if llm_service.provider == "gemini" and i < len(chunks) - 1:  # Don't delay after last chunk
+                # NOTE: This manual rate limiting will be replaced by Decorator pattern in future
+                if llm_context.get_current_provider() == "gemini" and i < len(chunks) - 1:  # Don't delay after last chunk
                     # Check if using Flash (10 RPM) or Pro (2 RPM) model
                     model_name = settings.gemini_model.lower()
                     if "flash" in model_name:
@@ -245,7 +370,7 @@ def summarize_chunks_task(self, file_id: str, chunk_ids: List[str], note_style: 
                 
                 # If it's a rate limit error, wait longer before processing next chunk
                 error_str = str(e).lower()
-                if llm_service.provider == "gemini" and ("429" in error_str or "quota" in error_str or "rate limit" in error_str):
+                if llm_context.get_current_provider() == "gemini" and ("429" in error_str or "quota" in error_str or "rate limit" in error_str):
                     if i < len(chunks) - 1:  # Don't delay after last chunk
                         # Try to extract retry delay from error message
                         import re
@@ -292,7 +417,12 @@ def summarize_chunks_task(self, file_id: str, chunk_ids: List[str], note_style: 
         }
         
     except Exception as e:
-        db.update_file_status(file_id, 'failed', error=str(e))
+        # Use State Machine: transition to failed
+        try:
+            fsm.fail(str(e))
+        except Exception:
+            # Fallback to direct update if state machine fails
+            db.update_file_status(file_id, 'failed', error=str(e))
         raise
 
 
@@ -322,26 +452,35 @@ def synthesize_notes_task(self, file_id: str, note_style: str = "moderate", user
         
         # Extract summary texts
         summary_texts = [s['summary_text'] for s in summaries]
-        
-        # For hierarchical synthesis with many summaries, do it in stages
+
+        # Use State Machine: transition to synthesizing
+        file_info = db.get_file(file_id)
+        current_status = file_info['status'] if file_info else 'summarizing'
+        fsm = create_state_machine_from_db(file_id, current_status, db_update_callback)
+        fsm.start_synthesizing()
+
+        # For hierarchical synthesis with many summaries, do it in stages using Strategy Pattern
         if len(summary_texts) > 20:
             # First level: synthesize in groups of 10
             intermediate_summaries = []
             for i in range(0, len(summary_texts), 10):
                 group = summary_texts[i:i+10]
-                result = llm_service.synthesize_notes(group, note_style, user_prompt)
+                result = llm_context.synthesize_notes(group, note_style, user_prompt)
                 intermediate_summaries.append(result['text'])
-            
+
             # Final synthesis with note style
-            final_result = llm_service.synthesize_notes(intermediate_summaries, note_style, user_prompt)
+            final_result = llm_context.synthesize_notes(intermediate_summaries, note_style, user_prompt)
         else:
             # Direct synthesis for smaller documents with note style
-            final_result = llm_service.synthesize_notes(summary_texts, note_style, user_prompt)
+            final_result = llm_context.synthesize_notes(summary_texts, note_style, user_prompt)
+        
+        # Post-process: Convert pseudo-code blocks with math notation to LaTeX equations
+        processed_note_text = convert_pseudo_code_to_math(final_result['text'])
         
         # Store final note
         note_data = {
             'file_id': file_id,
-            'note_text': final_result['text'],
+            'note_text': processed_note_text,
             'metadata': {
                 'total_chunks': len(summaries),
                 'synthesis_method': 'hierarchical' if len(summary_texts) > 20 else 'direct',
@@ -380,9 +519,9 @@ def synthesize_notes_task(self, file_id: str, note_style: str = "moderate", user
                 if note_data.get('metadata'):
                     frontmatter_metadata.update(note_data['metadata'])
                 
-                # Save as markdown file
+                # Save as markdown file (use processed note text with converted math)
                 save_note_as_markdown(
-                    note_text=final_result['text'],
+                    note_text=processed_note_text,
                     output_path=md_file_path,
                     metadata=frontmatter_metadata
                 )
@@ -391,17 +530,26 @@ def synthesize_notes_task(self, file_id: str, note_style: str = "moderate", user
                 # Log error but don't fail the task
                 print(f"Warning: Failed to save note locally as markdown: {str(e)}")
         
-        # Update file status to completed
-        db.update_file_status(file_id, 'completed')
-        
+        # Use State Machine: transition to completed
+        try:
+            fsm.complete()
+        except Exception:
+            # Fallback to direct update if state machine fails
+            db.update_file_status(file_id, 'completed')
+
         return {
             'status': 'completed',
-            'note_length': len(final_result['text']),
+            'note_length': len(processed_note_text),
             'tokens_used': final_result.get('tokens_used', 0)
         }
-        
+
     except Exception as e:
-        db.update_file_status(file_id, 'failed', error=str(e))
+        # Use State Machine: transition to failed
+        try:
+            fsm.fail(str(e))
+        except Exception:
+            # Fallback to direct update if state machine fails
+            db.update_file_status(file_id, 'failed', error=str(e))
         raise
 
 
