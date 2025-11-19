@@ -1,5 +1,5 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Query, Form
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Form
+from fastapi.responses import JSONResponse, Response, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List
@@ -99,8 +99,11 @@ async def root():
             "upload": "/upload",
             "status": "/status/{file_id}",
             "note": "/notes/{file_id}",
+            "download_note_md": "/notes/{file_id}/download",
+            "download_note_pdf": "/notes/{file_id}/download-pdf",
             "qa": "/qa/{file_id}",
-            "files": "/files"
+            "files": "/files",
+            "retry": "/files/{file_id}/retry"
         }
     }
 
@@ -323,6 +326,152 @@ async def get_note(file_id: str):
         metadata=note.get('metadata'),
         created_at=note['created_at']
     )
+
+
+@app.get("/notes/{file_id}/download")
+async def download_note_markdown(file_id: str):
+    """
+    Download the generated note as a Markdown (.md) file.
+
+    Args:
+        file_id: File ID
+
+    Returns:
+        Markdown file for download
+    """
+    from utils import get_note_filename, save_note_as_markdown
+
+    # Check if file exists
+    file_info = db.get_file(file_id)
+    if not file_info:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    # Check status
+    if file_info['status'] != 'completed':
+        raise HTTPException(
+            status_code=400,
+            detail=f"Note not ready. Current status: {file_info['status']}"
+        )
+
+    # Get note
+    note = db.get_note_by_file(file_id)
+    if not note:
+        raise HTTPException(status_code=404, detail="Note not found")
+
+    # Prepare markdown content with frontmatter
+    markdown_content = ""
+
+    # Add YAML frontmatter with metadata
+    metadata = note.get('metadata', {})
+    frontmatter_metadata = {
+        'file_id': file_id,
+        'original_filename': file_info.get('original_filename', ''),
+        'created_at': note.get('created_at', ''),
+    }
+
+    # Add note metadata if available
+    if metadata:
+        frontmatter_metadata.update(metadata)
+
+    # Build frontmatter YAML
+    markdown_content += "---\n"
+    for key, value in frontmatter_metadata.items():
+        markdown_content += f"{key}: {value}\n"
+    markdown_content += "---\n\n"
+
+    # Add note text
+    markdown_content += note['note_text']
+
+    # Generate filename for download
+    original_filename = file_info.get('original_filename', '')
+    download_filename = get_note_filename(original_filename, file_id)
+
+    # Return markdown file as download
+    return Response(
+        content=markdown_content,
+        media_type="text/markdown",
+        headers={
+            "Content-Disposition": f'attachment; filename="{download_filename}"'
+        }
+    )
+
+
+@app.get("/notes/{file_id}/download-pdf")
+async def download_note_pdf(file_id: str):
+    """
+    Download the generated note as a PDF (.pdf) file.
+
+    Args:
+        file_id: File ID
+
+    Returns:
+        PDF file for download
+    """
+    from utils import get_note_filename
+    from io import BytesIO
+
+    # Check if file exists
+    file_info = db.get_file(file_id)
+    if not file_info:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    # Check status
+    if file_info['status'] != 'completed':
+        raise HTTPException(
+            status_code=400,
+            detail=f"Note not ready. Current status: {file_info['status']}"
+        )
+
+    # Get note
+    note = db.get_note_by_file(file_id)
+    if not note:
+        raise HTTPException(status_code=404, detail="Note not found")
+
+    try:
+        from markdown_pdf import MarkdownPdf, Section
+
+        # Get original filename for use in PDF metadata
+        original_filename = file_info.get('original_filename', '')
+
+        # For PDF, use note content without frontmatter
+        note_text = note['note_text']
+
+        # Ensure the document starts with an h1 heading for proper TOC generation
+        note_text_stripped = note_text.strip()
+
+        # Check if note starts with any heading
+        if not note_text_stripped.startswith('#'):
+            # Add a default heading based on filename
+            title = original_filename.replace('.pdf', '') if original_filename else file_id
+            note_text = f"# {title}\n\n{note_text}"
+
+        # Create PDF
+        pdf = MarkdownPdf(toc_level=2)
+        pdf.add_section(Section(note_text, toc=True))
+
+        # Generate PDF to BytesIO
+        pdf_bytes = BytesIO()
+        pdf.save(pdf_bytes)
+        pdf_bytes.seek(0)
+
+        # Generate filename for download
+        md_filename = get_note_filename(original_filename, file_id)
+        pdf_filename = md_filename.replace('.md', '.pdf') if md_filename.endswith('.md') else f"{md_filename}.pdf"
+
+        # Return PDF file as download
+        return Response(
+            content=pdf_bytes.getvalue(),
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": f'attachment; filename="{pdf_filename}"'
+            }
+        )
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to generate PDF: {str(e)}"
+        )
 
 
 @app.post("/qa/{file_id}", response_model=AnswerResponse)
